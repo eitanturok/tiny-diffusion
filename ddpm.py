@@ -64,26 +64,17 @@ class NoiseScheduler():
         self.alphas_cumprod = torch.cumprod(self.alphas, axis=0)
         self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.)
 
-        # required for self.add_noise
-        self.sqrt_alphas_cumprod = self.alphas_cumprod ** 0.5
-        self.sqrt_one_minus_alphas_cumprod = (1 - self.alphas_cumprod) ** 0.5
-
-        # required for reconstruct_x0
-        self.sqrt_inv_alphas_cumprod = torch.sqrt(1 / self.alphas_cumprod)
-        self.sqrt_inv_alphas_cumprod_minus_one = torch.sqrt(1 / self.alphas_cumprod - 1)
-
         # required for q_posterior
         self.posterior_mean_coef1 = self.betas * torch.sqrt(self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
         self.posterior_mean_coef2 = (1. - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1. - self.alphas_cumprod)
 
     # Sampling Alg, Step 4 2
     def reconstruct_x0(self, x_t, t, noise):
-        s1 = self.sqrt_inv_alphas_cumprod[t]
-        s2 = self.sqrt_inv_alphas_cumprod_minus_one[t]
-        s1 = s1.reshape(-1, 1)
-        s2 = s2.reshape(-1, 1)
-        return s1 * x_t - s2 * noise
+        mean_coeff = (1 / self.alphas_cumprod[t]).sqrt().reshape(-1, 1)
+        var_coeff = (1 / self.alphas_cumprod[t] - 1).sqrt().reshape(-1, 1)
+        return mean_coeff * x_t - var_coeff * noise
 
+    # Equation (6), (7)
     def q_posterior(self, x_0, x_t, t):
         s1 = self.posterior_mean_coef1[t]
         s2 = self.posterior_mean_coef2[t]
@@ -92,6 +83,7 @@ class NoiseScheduler():
         mu = s1 * x_0 + s2 * x_t
         return mu
 
+    # Equation (7) right columns
     def get_variance(self, t):
         if t == 0: return 0
         variance = self.betas[t] * (1. - self.alphas_cumprod_prev[t]) / (1. - self.alphas_cumprod[t])
@@ -112,15 +104,14 @@ class NoiseScheduler():
         pred_prev_sample = pred_prev_sample + variance
         return pred_prev_sample
 
-    # Training Alg, Step 5
-    def add_noise(self, x_start, x_noise, timesteps):
-        s1 = self.sqrt_alphas_cumprod[timesteps]
-        s2 = self.sqrt_one_minus_alphas_cumprod[timesteps]
-
-        s1 = s1.reshape(-1, 1)
-        s2 = s2.reshape(-1, 1)
-
-        return s1 * x_start + s2 * x_noise
+    # forward process
+    # sample from q( x_t | x_0 ) in equation (4)
+    # part of training algorithm, step 5
+    def add_noise(self, x_start:torch.Tensor, noise:torch.Tensor, timesteps:torch.Tensor):
+        mean_coeff = self.alphas_cumprod[timesteps].sqrt().reshape(-1, 1)
+        var_coeff = (1 - self.alphas_cumprod[timesteps]).sqrt().reshape(-1, 1)
+        noisy_x = mean_coeff * x_start + var_coeff * noise
+        return noisy_x
 
     def __len__(self):
         return self.num_timesteps
