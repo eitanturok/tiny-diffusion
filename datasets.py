@@ -3,14 +3,14 @@ import pandas as pd
 import torch
 
 from sklearn.datasets import make_moons
-from torch.utils.data import TensorDataset
+from torch.utils.data import Dataset
 
 
 def moons_dataset(n=8000):
     X, _ = make_moons(n_samples=n, random_state=42, noise=0.03)
     X[:, 0] = (X[:, 0] + 0.3) * 2 - 1
     X[:, 1] = (X[:, 1] + 0.3) * 3 - 1
-    return TensorDataset(torch.from_numpy(X.astype(np.float32)))
+    return torch.from_numpy(X.astype(np.float32))
 
 
 def line_dataset(n=8000):
@@ -19,7 +19,7 @@ def line_dataset(n=8000):
     y = rng.uniform(-1, 1, n)
     X = np.stack((x, y), axis=1)
     X *= 4
-    return TensorDataset(torch.from_numpy(X.astype(np.float32)))
+    return torch.from_numpy(X.astype(np.float32))
 
 
 def circle_dataset(n=8000):
@@ -35,7 +35,7 @@ def circle_dataset(n=8000):
     y += r * np.sin(theta)
     X = np.stack((x, y), axis=1)
     X *= 3
-    return TensorDataset(torch.from_numpy(X.astype(np.float32)))
+    return torch.from_numpy(X.astype(np.float32))
 
 
 def dino_dataset(n=8000):
@@ -51,17 +51,15 @@ def dino_dataset(n=8000):
     x = (x/54 - 1) * 4
     y = (y/48 - 1) * 4
     X = np.stack((x, y), axis=1)
-    return TensorDataset(torch.from_numpy(X.astype(np.float32)))
+    return torch.from_numpy(X.astype(np.float32))
 
+name_to_make_dataset = {'moons': moons_dataset, 'dino': dino_dataset, 'line': line_dataset, 'circle': circle_dataset}
 
-def get_dataset(name, n=8000):
-    if name == "moons":
-        return moons_dataset(n)
-    elif name == "dino":
-        return dino_dataset(n)
-    elif name == "line":
-        return line_dataset(n)
-    elif name == "circle":
-        return circle_dataset(n)
-    else:
-        raise ValueError(f"Unknown dataset: {name}")
+class MyDataset(Dataset):
+    def __init__(self, name, n):
+        make_dataset = name_to_make_dataset[name]
+        self.data = make_dataset(n)
+    def __getitem__(self, idx): return {'data': self.data[idx]}
+    def __len__(self): return len(self.data)
+
+def get_dataset(name, n=8000): return MyDataset(name, n)

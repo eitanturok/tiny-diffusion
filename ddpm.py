@@ -1,3 +1,6 @@
+# "Denoising Diffusion Probabilistic Models" https://arxiv.org/abs/2006.11239
+# Resources:
+# Annotated Diffusion https://huggingface.co/blog/annotated-diffusion
 import argparse
 import os
 
@@ -13,6 +16,7 @@ import numpy as np
 import datasets
 from positional_embeddings import PositionalEmbedding
 
+from icecream import ic
 
 class Block(nn.Module):
     def __init__(self, size: int):
@@ -52,24 +56,17 @@ class MLP(nn.Module):
 
 
 class NoiseScheduler():
-    def __init__(self,
-                 num_timesteps=1000,
-                 beta_start=0.0001,
-                 beta_end=0.02,
-                 beta_schedule="linear"):
+    def __init__(self, num_timesteps=1000, beta_start=0.0001, beta_end=0.02, beta_schedule="linear"):
 
         self.num_timesteps = num_timesteps
         if beta_schedule == "linear":
-            self.betas = torch.linspace(
-                beta_start, beta_end, num_timesteps, dtype=torch.float32)
+            self.betas = torch.linspace(beta_start, beta_end, num_timesteps, dtype=torch.float32)
         elif beta_schedule == "quadratic":
-            self.betas = torch.linspace(
-                beta_start ** 0.5, beta_end ** 0.5, num_timesteps, dtype=torch.float32) ** 2
+            self.betas = torch.linspace(beta_start ** 0.5, beta_end ** 0.5, num_timesteps, dtype=torch.float32) ** 2
 
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, axis=0)
-        self.alphas_cumprod_prev = F.pad(
-            self.alphas_cumprod[:-1], (1, 0), value=1.)
+        self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.)
 
         # required for self.add_noise
         self.sqrt_alphas_cumprod = self.alphas_cumprod ** 0.5
@@ -77,13 +74,13 @@ class NoiseScheduler():
 
         # required for reconstruct_x0
         self.sqrt_inv_alphas_cumprod = torch.sqrt(1 / self.alphas_cumprod)
-        self.sqrt_inv_alphas_cumprod_minus_one = torch.sqrt(
-            1 / self.alphas_cumprod - 1)
+        self.sqrt_inv_alphas_cumprod_minus_one = torch.sqrt(1 / self.alphas_cumprod - 1)
 
         # required for q_posterior
         self.posterior_mean_coef1 = self.betas * torch.sqrt(self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
         self.posterior_mean_coef2 = (1. - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1. - self.alphas_cumprod)
 
+    # Sampling Alg, Step 4 2
     def reconstruct_x0(self, x_t, t, noise):
         s1 = self.sqrt_inv_alphas_cumprod[t]
         s2 = self.sqrt_inv_alphas_cumprod_minus_one[t]
@@ -121,6 +118,7 @@ class NoiseScheduler():
 
         return pred_prev_sample
 
+    # Training Alg, Step 5
     def add_noise(self, x_start, x_noise, timesteps):
         s1 = self.sqrt_alphas_cumprod[timesteps]
         s2 = self.sqrt_one_minus_alphas_cumprod[timesteps]
@@ -133,6 +131,35 @@ class NoiseScheduler():
     def __len__(self):
         return self.num_timesteps
 
+
+def train_step(batch, model, noise_scheduler, optimizer):
+
+    x = batch['data']
+    batch_size = x.shape[0]
+
+    # Step 3: uniformly sample a noise level t for each image
+    # Q: torch.randint(0, timesteps) or torch.randint(1, timesteps+1)?
+    timesteps = torch.randint(0, noise_scheduler.num_timesteps, (batch_size,), device=x.device).long()
+    # Step 4: sample noise from a standard normal
+    noise = torch.randn(x.shape)
+
+    # Step 5 (multiple parts):
+    noisy_x = noise_scheduler.add_noise(x, noise, timesteps) # forward process
+    pred_noise = model(noisy_x, timesteps)
+    loss = F.mse_loss(pred_noise, noise, reduction='mean')
+    loss.backward()
+    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
+    optimizer.zero_grad()
+
+    ret = {
+        'timesteps': timesteps,
+        'noise': noise,
+        'noisy_x': noisy_x,
+        'pred_noise': pred_noise,
+        'loss': loss.detach().item(),
+    }
+    return ret
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -153,8 +180,7 @@ if __name__ == "__main__":
     config = parser.parse_args()
 
     dataset = datasets.get_dataset(config.dataset)
-    dataloader = DataLoader(
-        dataset, batch_size=config.train_batch_size, shuffle=True, drop_last=True)
+    dataloader = DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True, drop_last=True)
 
     model = MLP(
         hidden_size=config.hidden_size,
@@ -181,24 +207,22 @@ if __name__ == "__main__":
         progress_bar = tqdm(total=len(dataloader))
         progress_bar.set_description(f"Epoch {epoch}")
         for step, batch in enumerate(dataloader):
-            batch = batch[0]
-            noise = torch.randn(batch.shape)
-            timesteps = torch.randint(
-                0, noise_scheduler.num_timesteps, (batch.shape[0],)
-            ).long()
+            ret = train_step(batch, model, noise_scheduler, optimizer)
+            # batch = batch[0]
+            # noise = torch.randn(batch.shape)
+            # timesteps = torch.randint(0, noise_scheduler.num_timesteps, (batch.shape[0],)).long()
+            # noisy = noise_scheduler.add_noise(batch, noise, timesteps)
+            # noise_pred = model(noisy, timesteps)
+            # loss = F.mse_loss(noise_pred, noise)
+            # loss.backward()
 
-            noisy = noise_scheduler.add_noise(batch, noise, timesteps)
-            noise_pred = model(noisy, timesteps)
-            loss = F.mse_loss(noise_pred, noise)
-            loss.backward()
-
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            optimizer.zero_grad()
+            # nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # optimizer.step()
+            # optimizer.zero_grad()
 
             progress_bar.update(1)
-            logs = {"loss": loss.detach().item(), "step": global_step}
-            losses.append(loss.detach().item())
+            logs = {"loss": ret['loss'], "step": global_step}
+            losses.append(ret['loss'])
             progress_bar.set_postfix(**logs)
             global_step += 1
         progress_bar.close()
