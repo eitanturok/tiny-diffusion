@@ -6,6 +6,7 @@ import os
 
 import torch
 from torch import nn
+from torch.optim import AdamW
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -56,14 +57,9 @@ class MLP(nn.Module):
 
 
 class NoiseScheduler():
-    def __init__(self, num_timesteps=1000, beta_start=0.0001, beta_end=0.02, beta_schedule="linear"):
-
+    def __init__(self, num_timesteps=1000, beta_start=0.0001, beta_end=0.02):
         self.num_timesteps = num_timesteps
-        if beta_schedule == "linear":
-            self.betas = torch.linspace(beta_start, beta_end, num_timesteps, dtype=torch.float32)
-        elif beta_schedule == "quadratic":
-            self.betas = torch.linspace(beta_start ** 0.5, beta_end ** 0.5, num_timesteps, dtype=torch.float32) ** 2
-
+        self.betas = torch.linspace(beta_start, beta_end, num_timesteps, dtype=torch.float32)
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, axis=0)
         self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.)
@@ -97,25 +93,23 @@ class NoiseScheduler():
         return mu
 
     def get_variance(self, t):
-        if t == 0:
-            return 0
-
+        if t == 0: return 0
         variance = self.betas[t] * (1. - self.alphas_cumprod_prev[t]) / (1. - self.alphas_cumprod[t])
         variance = variance.clip(1e-20)
         return variance
 
-    def step(self, model_output, timestep, sample):
-        t = timestep
-        pred_original_sample = self.reconstruct_x0(sample, t, model_output)
+    def remove_noise(self, sample:torch.Tensor, t:torch.Tensor, pred_noise:torch.Tensor):
+        # Step 3:
+        # is it t>1 or t>0?
+        noise = torch.randn_like(pred_noise) if t > 0 else torch.zeros_like(pred_noise)
+
+        # Step 4:
+        pred_original_sample = self.reconstruct_x0(sample, t, pred_noise)
         pred_prev_sample = self.q_posterior(pred_original_sample, sample, t)
 
-        variance = 0
-        if t > 0:
-            noise = torch.randn_like(model_output)
-            variance = (self.get_variance(t) ** 0.5) * noise
+        variance = (self.get_variance(t) ** 0.5) * noise
 
         pred_prev_sample = pred_prev_sample + variance
-
         return pred_prev_sample
 
     # Training Alg, Step 5
@@ -132,20 +126,21 @@ class NoiseScheduler():
         return self.num_timesteps
 
 
-def train_step(batch, model, noise_scheduler, optimizer):
+def train(batch, model, noise_scheduler:NoiseScheduler, optimizer:AdamW):
+    model.train()
 
-    x = batch['data']
-    batch_size = x.shape[0]
+    # Step 2: this step is implicitly performed when we choose our data x
+    x, batch_size = batch['data'], batch['data'].shape[0]
 
     # Step 3: uniformly sample a noise level t for each image
     # Q: torch.randint(0, timesteps) or torch.randint(1, timesteps+1)?
-    timesteps = torch.randint(0, noise_scheduler.num_timesteps, (batch_size,), device=x.device).long()
+    t = torch.randint(0, noise_scheduler.num_timesteps, (batch_size,), device=x.device).long() #(b,)
     # Step 4: sample noise from a standard normal
-    noise = torch.randn(x.shape)
+    noise = torch.randn(x.shape) # (b,c,h,w)
 
     # Step 5 (multiple parts):
-    noisy_x = noise_scheduler.add_noise(x, noise, timesteps) # forward process
-    pred_noise = model(noisy_x, timesteps)
+    noisy_x = noise_scheduler.add_noise(x, noise, t) # forward process
+    pred_noise = model(noisy_x, t)
     loss = F.mse_loss(pred_noise, noise, reduction='mean')
     loss.backward()
     nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -153,13 +148,38 @@ def train_step(batch, model, noise_scheduler, optimizer):
     optimizer.zero_grad()
 
     ret = {
-        'timesteps': timesteps,
+        't': t,
         'noise': noise,
         'noisy_x': noisy_x,
         'pred_noise': pred_noise,
         'loss': loss.detach().item(),
     }
     return ret
+
+@torch.no_grad()
+def sample(batch_shape, model, noise_scheduler:NoiseScheduler, eval_batch_size:int=1):
+    model.eval()
+    device = next(model.parameters()).device
+
+    # Step 1: initialize image as standard gaussian noise
+    curr_image = torch.randn((eval_batch_size, *batch_shape[1:]), device=device) # (1,c,h,w)
+    images, prev_image = [curr_image], None
+
+    # Step 2: denoise image in T steps in decreasing order
+    for t_scalar in tqdm(list(range(noise_scheduler.num_timesteps)[::-1])):
+        t = torch.full((eval_batch_size,), t_scalar, device=device).long() #(b,)
+        # Steps 3, 4 are performed in the noise scheduler
+        pred_noise = model(curr_image, t)
+        prev_image = noise_scheduler.remove_noise(curr_image, t_scalar, pred_noise)
+        images.append(prev_image)
+        curr_image = prev_image
+
+    ret = {
+        'image': prev_image,
+        'images': images
+    }
+    return ret
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -182,70 +202,46 @@ if __name__ == "__main__":
     dataset = datasets.get_dataset(config.dataset)
     dataloader = DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True, drop_last=True)
 
-    model = MLP(
-        hidden_size=config.hidden_size,
-        hidden_layers=config.hidden_layers,
-        emb_size=config.embedding_size,
-        time_emb=config.time_embedding,
-        input_emb=config.input_embedding)
-
-    noise_scheduler = NoiseScheduler(
-        num_timesteps=config.num_timesteps,
-        beta_schedule=config.beta_schedule)
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.learning_rate,
-    )
+    model = MLP(hidden_size=config.hidden_size, hidden_layers=config.hidden_layers, emb_size=config.embedding_size, time_emb=config.time_embedding, input_emb=config.input_embedding)
+    noise_scheduler = NoiseScheduler(num_timesteps=config.num_timesteps)
+    optimizer = AdamW(model.parameters(), lr=config.learning_rate)
 
     global_step = 0
     frames = []
     losses = []
     print("Training model...")
     for epoch in range(config.num_epochs):
-        model.train()
         progress_bar = tqdm(total=len(dataloader))
         progress_bar.set_description(f"Epoch {epoch}")
         for step, batch in enumerate(dataloader):
-            ret = train_step(batch, model, noise_scheduler, optimizer)
-            # batch = batch[0]
-            # noise = torch.randn(batch.shape)
-            # timesteps = torch.randint(0, noise_scheduler.num_timesteps, (batch.shape[0],)).long()
-            # noisy = noise_scheduler.add_noise(batch, noise, timesteps)
-            # noise_pred = model(noisy, timesteps)
-            # loss = F.mse_loss(noise_pred, noise)
-            # loss.backward()
-
-            # nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            # optimizer.step()
-            # optimizer.zero_grad()
-
+            train_ret = train(batch, model, noise_scheduler, optimizer)
             progress_bar.update(1)
-            logs = {"loss": ret['loss'], "step": global_step}
-            losses.append(ret['loss'])
+            logs = {"loss": train_ret['loss'], "step": global_step}
+            losses.append(train_ret['loss'])
             progress_bar.set_postfix(**logs)
             global_step += 1
         progress_bar.close()
 
         if epoch % config.save_images_step == 0 or epoch == config.num_epochs - 1:
             # generate data with the model to later visualize the learning process
-            model.eval()
-            sample = torch.randn(config.eval_batch_size, 2)
-            timesteps = list(range(len(noise_scheduler)))[::-1]
-            for i, t in enumerate(tqdm(timesteps)):
-                t = torch.from_numpy(np.repeat(t, config.eval_batch_size)).long()
-                with torch.no_grad():
-                    residual = model(sample, t)
-                sample = noise_scheduler.step(residual, t[0], sample)
-            frames.append(sample.numpy())
+            sample_ret = sample(batch['data'].shape, model, noise_scheduler, eval_batch_size=config.eval_batch_size)
+            # model.eval()
+            # sample = torch.randn(config.eval_batch_size, 2)
+            # timesteps = list(range(len(noise_scheduler)))[::-1]
+            # for i, t in enumerate(tqdm(timesteps)):
+            #     t = torch.from_numpy(np.repeat(t, config.eval_batch_size)).long()
+            #     with torch.no_grad():
+            #         residual = model(sample, t)
+            #     sample = noise_scheduler.step(residual, t[0], sample)
+            frames.append(sample_ret['image'].numpy())
 
-    print("Saving model...")
     outdir = f"exps/{config.experiment_name}"
+    print(f"Saving model in {outdir}...")
     os.makedirs(outdir, exist_ok=True)
     torch.save(model.state_dict(), f"{outdir}/model.pth")
 
-    print("Saving images...")
     imgdir = f"{outdir}/images"
+    print(f"Saving images in {imgdir}...")
     os.makedirs(imgdir, exist_ok=True)
     frames = np.stack(frames)
     xmin, xmax = -6, 6
@@ -258,8 +254,10 @@ if __name__ == "__main__":
         plt.savefig(f"{imgdir}/{i:04}.png")
         plt.close()
 
-    print("Saving loss as numpy array...")
-    np.save(f"{outdir}/loss.npy", np.array(losses))
+    loss_path = f"{outdir}/loss.npy"
+    print(f"Saving loss as numpy array in {loss_path}...")
+    np.save(loss_path, np.array(losses))
 
-    print("Saving frames...")
-    np.save(f"{outdir}/frames.npy", frames)
+    frame_path = f"{outdir}/frames.npy"
+    print(f"Saving frames in {frame_path}...")
+    np.save(frame_path, frames)
