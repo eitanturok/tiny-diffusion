@@ -17,8 +17,6 @@ import numpy as np
 import datasets
 from positional_embeddings import PositionalEmbedding
 
-from icecream import ic
-
 class Block(nn.Module):
     def __init__(self, size: int):
         super().__init__()
@@ -62,51 +60,26 @@ class NoiseScheduler():
         self.betas = torch.linspace(beta_start, beta_end, num_timesteps, dtype=torch.float32)
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, axis=0)
-        self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.)
 
-        # required for q_posterior
-        self.posterior_mean_coef1 = self.betas * torch.sqrt(self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
-        self.posterior_mean_coef2 = (1. - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1. - self.alphas_cumprod)
-
-    # Sampling Alg, Step 4 2
-    def reconstruct_x0(self, x_t, t, noise):
-        mean_coeff = (1 / self.alphas_cumprod[t]).sqrt().reshape(-1, 1)
-        var_coeff = (1 / self.alphas_cumprod[t] - 1).sqrt().reshape(-1, 1)
-        return mean_coeff * x_t - var_coeff * noise
-
-    # Equation (6), (7)
-    def q_posterior(self, x_0, x_t, t):
-        s1 = self.posterior_mean_coef1[t]
-        s2 = self.posterior_mean_coef2[t]
-        s1 = s1.reshape(-1, 1)
-        s2 = s2.reshape(-1, 1)
-        mu = s1 * x_0 + s2 * x_t
-        return mu
-
-    # Equation (7) right columns
-    def get_variance(self, t):
-        if t == 0: return 0
-        variance = self.betas[t] * (1. - self.alphas_cumprod_prev[t]) / (1. - self.alphas_cumprod[t])
-        variance = variance.clip(1e-20)
-        return variance
-
-    def remove_noise(self, sample:torch.Tensor, t:torch.Tensor, pred_noise:torch.Tensor):
-        # Step 3:
-        # is it t>1 or t>0?
+    # reverse process
+    # sample x_{t-1} ~ p_\theta( x_{t-1} | x_t ) in equation (1) right column
+    # part of the Sampling Algorithm steps 3-4
+    def remove_noise(self, noisy_x:torch.Tensor, t:torch.Tensor, pred_noise:torch.Tensor):
+        # Step 3: sample gaussian noise
         noise = torch.randn_like(pred_noise) if t > 0 else torch.zeros_like(pred_noise)
 
-        # Step 4:
-        pred_original_sample = self.reconstruct_x0(sample, t, pred_noise)
-        pred_prev_sample = self.q_posterior(pred_original_sample, sample, t)
-
-        variance = (self.get_variance(t) ** 0.5) * noise
-
-        pred_prev_sample = pred_prev_sample + variance
-        return pred_prev_sample
+        # Step 4: compute x_prev
+        # Equation (11) for mean_prev
+        noise_coeff = self.betas[t] / (1 - self.alphas_cumprod[t]).sqrt()
+        mean_prev = (1 / self.alphas[t]).sqrt() * (noisy_x - noise_coeff * pred_noise)
+        # Equation (7) right column for variance_prev
+        variance_prev = torch.zeros(1) if t != 0 else self.betas[t] * (1. - self.alphas_cumprod[t-1]) / (1. - self.alphas_cumprod[t])
+        x_prev = mean_prev + variance_prev.sqrt() * noise
+        return x_prev
 
     # forward process
-    # sample from q( x_t | x_0 ) in equation (4)
-    # part of training algorithm, step 5
+    # sample x_t ~ q( x_t | x_0 ) in equation (4)
+    # part of the Training Algorithm, step 5
     def add_noise(self, x_start:torch.Tensor, noise:torch.Tensor, timesteps:torch.Tensor):
         mean_coeff = self.alphas_cumprod[timesteps].sqrt().reshape(-1, 1)
         var_coeff = (1 - self.alphas_cumprod[timesteps]).sqrt().reshape(-1, 1)
@@ -116,7 +89,7 @@ class NoiseScheduler():
     def __len__(self):
         return self.num_timesteps
 
-
+# "Algorithm 1: Training" from paper, pg 4.
 def train(batch, model, noise_scheduler:NoiseScheduler, optimizer:AdamW):
     model.train()
 
@@ -124,7 +97,6 @@ def train(batch, model, noise_scheduler:NoiseScheduler, optimizer:AdamW):
     x, batch_size = batch['data'], batch['data'].shape[0]
 
     # Step 3: uniformly sample a noise level t for each image
-    # Q: torch.randint(0, timesteps) or torch.randint(1, timesteps+1)?
     t = torch.randint(0, noise_scheduler.num_timesteps, (batch_size,), device=x.device).long() #(b,)
     # Step 4: sample noise from a standard normal
     noise = torch.randn(x.shape) # (b,c,h,w)
@@ -147,6 +119,7 @@ def train(batch, model, noise_scheduler:NoiseScheduler, optimizer:AdamW):
     }
     return ret
 
+# "Algorithm 2: Sampling" from paper, pg 4.
 @torch.no_grad()
 def sample(batch_shape, model, noise_scheduler:NoiseScheduler, eval_batch_size:int=1):
     model.eval()
@@ -171,8 +144,7 @@ def sample(batch_shape, model, noise_scheduler:NoiseScheduler, eval_batch_size:i
     }
     return ret
 
-
-if __name__ == "__main__":
+def make_config():
     parser = argparse.ArgumentParser()
     parser.add_argument("--experiment_name", type=str, default="base")
     parser.add_argument("--dataset", type=str, default="dino", choices=["circle", "dino", "line", "moons"])
@@ -189,47 +161,16 @@ if __name__ == "__main__":
     parser.add_argument("--input_embedding", type=str, default="sinusoidal", choices=["sinusoidal", "learnable", "linear", "identity"])
     parser.add_argument("--save_images_step", type=int, default=1)
     config = parser.parse_args()
+    return config
 
-    dataset = datasets.get_dataset(config.dataset)
-    dataloader = DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True, drop_last=True)
 
-    model = MLP(hidden_size=config.hidden_size, hidden_layers=config.hidden_layers, emb_size=config.embedding_size, time_emb=config.time_embedding, input_emb=config.input_embedding)
-    noise_scheduler = NoiseScheduler(num_timesteps=config.num_timesteps)
-    optimizer = AdamW(model.parameters(), lr=config.learning_rate)
-
-    global_step = 0
-    frames = []
-    losses = []
-    print("Training model...")
-    for epoch in range(config.num_epochs):
-        progress_bar = tqdm(total=len(dataloader))
-        progress_bar.set_description(f"Epoch {epoch}")
-        for step, batch in enumerate(dataloader):
-            train_ret = train(batch, model, noise_scheduler, optimizer)
-            progress_bar.update(1)
-            logs = {"loss": train_ret['loss'], "step": global_step}
-            losses.append(train_ret['loss'])
-            progress_bar.set_postfix(**logs)
-            global_step += 1
-        progress_bar.close()
-
-        if epoch % config.save_images_step == 0 or epoch == config.num_epochs - 1:
-            # generate data with the model to later visualize the learning process
-            sample_ret = sample(batch['data'].shape, model, noise_scheduler, eval_batch_size=config.eval_batch_size)
-            # model.eval()
-            # sample = torch.randn(config.eval_batch_size, 2)
-            # timesteps = list(range(len(noise_scheduler)))[::-1]
-            # for i, t in enumerate(tqdm(timesteps)):
-            #     t = torch.from_numpy(np.repeat(t, config.eval_batch_size)).long()
-            #     with torch.no_grad():
-            #         residual = model(sample, t)
-            #     sample = noise_scheduler.step(residual, t[0], sample)
-            frames.append(sample_ret['image'].numpy())
-
+def save(config, model, frames, losses):
     outdir = f"exps/{config.experiment_name}"
-    print(f"Saving model in {outdir}...")
     os.makedirs(outdir, exist_ok=True)
-    torch.save(model.state_dict(), f"{outdir}/model.pth")
+
+    model_path = f"{outdir}/model.pth"
+    print(f"Saving model in {model_path}...")
+    torch.save(model.state_dict(), model_path)
 
     imgdir = f"{outdir}/images"
     print(f"Saving images in {imgdir}...")
@@ -252,3 +193,41 @@ if __name__ == "__main__":
     frame_path = f"{outdir}/frames.npy"
     print(f"Saving frames in {frame_path}...")
     np.save(frame_path, frames)
+
+def trainer():
+
+    # init objects
+    config = make_config()
+    dataset = datasets.get_dataset(config.dataset)
+    dataloader = DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True, drop_last=True)
+    model = MLP(hidden_size=config.hidden_size, hidden_layers=config.hidden_layers, emb_size=config.embedding_size, time_emb=config.time_embedding, input_emb=config.input_embedding)
+    noise_scheduler = NoiseScheduler(num_timesteps=config.num_timesteps)
+    optimizer = AdamW(model.parameters(), lr=config.learning_rate)
+
+    # train ddpm
+    global_step, frames, losses = 0, [], []
+    print("Training model...")
+    for epoch in range(config.num_epochs):
+        progress_bar = tqdm(total=len(dataloader))
+        progress_bar.set_description(f"Epoch {epoch}")
+        for step, batch in enumerate(dataloader):
+            # train step
+            train_ret = train(batch, model, noise_scheduler, optimizer)
+            progress_bar.update(1)
+            logs = {"loss": train_ret['loss'], "step": global_step}
+            losses.append(train_ret['loss'])
+            progress_bar.set_postfix(**logs)
+            global_step += 1
+        progress_bar.close()
+
+        if epoch % config.save_images_step == 0 or epoch == config.num_epochs - 1:
+            # sample step
+            sample_ret = sample(batch['data'].shape, model, noise_scheduler, eval_batch_size=config.eval_batch_size)
+            frames.append(sample_ret['image'].numpy())
+
+    # save stuff
+    save(config, model, frames, losses)
+
+
+if __name__ == "__main__":
+    trainer()
