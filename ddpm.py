@@ -20,29 +20,19 @@ from positional_embeddings import PositionalEmbedding
 class Block(nn.Module):
     def __init__(self, size: int):
         super().__init__()
-
-        self.ff = nn.Linear(size, size)
-        self.act = nn.GELU()
-
-    def forward(self, x: torch.Tensor):
-        return x + self.act(self.ff(x))
+        self.ff, self.act = nn.Linear(size, size), nn.GELU()
+    def forward(self, x: torch.Tensor): return x + self.act(self.ff(x))
 
 
 class MLP(nn.Module):
-    def __init__(self, hidden_size: int = 128, hidden_layers: int = 3, emb_size: int = 128,
-                 time_emb: str = "sinusoidal", input_emb: str = "sinusoidal"):
+    def __init__(self, hidden_size: int = 128, hidden_layers: int = 3, emb_size: int = 128, time_emb: str = "sinusoidal", input_emb: str = "sinusoidal"):
         super().__init__()
-
         self.time_mlp = PositionalEmbedding(emb_size, time_emb)
         self.input_mlp1 = PositionalEmbedding(emb_size, input_emb, scale=25.0)
         self.input_mlp2 = PositionalEmbedding(emb_size, input_emb, scale=25.0)
 
-        concat_size = len(self.time_mlp.layer) + \
-            len(self.input_mlp1.layer) + len(self.input_mlp2.layer)
-        layers = [nn.Linear(concat_size, hidden_size), nn.GELU()]
-        for _ in range(hidden_layers):
-            layers.append(Block(hidden_size))
-        layers.append(nn.Linear(hidden_size, 2))
+        concat_size = len(self.time_mlp.layer) + len(self.input_mlp1.layer) + len(self.input_mlp2.layer)
+        layers = [nn.Linear(concat_size, hidden_size), nn.GELU()] + [Block(hidden_size) for _ in range(hidden_layers)] + [nn.Linear(hidden_size, 2)]
         self.joint_mlp = nn.Sequential(*layers)
 
     def forward(self, x, t):
@@ -54,7 +44,7 @@ class MLP(nn.Module):
         return x
 
 
-class NoiseScheduler():
+class DDPMNoiseScheduler():
     def __init__(self, num_timesteps=1000, beta_start=0.0001, beta_end=0.02):
         self.num_timesteps = num_timesteps
         self.betas = torch.linspace(beta_start, beta_end, num_timesteps, dtype=torch.float32)
@@ -64,14 +54,14 @@ class NoiseScheduler():
     # reverse process
     # sample x_{t-1} ~ p_\theta( x_{t-1} | x_t ) in equation (1) right column
     # part of the Sampling Algorithm steps 3-4
-    def remove_noise(self, noisy_x:torch.Tensor, t:torch.Tensor, pred_noise:torch.Tensor):
+    def remove_noise(self, noisy_x_curr:torch.Tensor, t:torch.Tensor, pred_noise:torch.Tensor):
         # Step 3: sample gaussian noise
         noise = torch.randn_like(pred_noise) if t > 0 else torch.zeros_like(pred_noise)
 
         # Step 4: compute x_prev
         # Equation (11) for mean_prev
         noise_coeff = self.betas[t] / (1 - self.alphas_cumprod[t]).sqrt()
-        mean_prev = (1 / self.alphas[t]).sqrt() * (noisy_x - noise_coeff * pred_noise)
+        mean_prev = (1 / self.alphas[t]).sqrt() * (noisy_x_curr - noise_coeff * pred_noise)
         # Equation (7) right column for variance_prev
         variance_prev = torch.zeros(1) if t != 0 else self.betas[t] * (1. - self.alphas_cumprod[t-1]) / (1. - self.alphas_cumprod[t])
         x_prev = mean_prev + variance_prev.sqrt() * noise
@@ -90,7 +80,7 @@ class NoiseScheduler():
         return self.num_timesteps
 
 # "Algorithm 1: Training" from paper, pg 4.
-def train(batch, model, noise_scheduler:NoiseScheduler, optimizer:AdamW):
+def train(batch, model, noise_scheduler:DDPMNoiseScheduler, optimizer:AdamW):
     model.train()
 
     # Step 2: this step is implicitly performed when we choose our data x
@@ -121,25 +111,25 @@ def train(batch, model, noise_scheduler:NoiseScheduler, optimizer:AdamW):
 
 # "Algorithm 2: Sampling" from paper, pg 4.
 @torch.no_grad()
-def sample(batch_shape, model, noise_scheduler:NoiseScheduler, eval_batch_size:int=1):
+def sample(batch_shape, model, noise_scheduler:DDPMNoiseScheduler, eval_batch_size:int=1):
     model.eval()
     device = next(model.parameters()).device
 
     # Step 1: initialize image as standard gaussian noise
-    curr_image = torch.randn((eval_batch_size, *batch_shape[1:]), device=device) # (1,c,h,w)
-    images, prev_image = [curr_image], None
+    curr_x = torch.randn((eval_batch_size, *batch_shape[1:]), device=device) # (1,c,h,w)
+    images, prev_x = [curr_x], None
 
     # Step 2: denoise image in T steps in decreasing order
     for t_scalar in tqdm(list(range(noise_scheduler.num_timesteps)[::-1])):
         t = torch.full((eval_batch_size,), t_scalar, device=device).long() #(b,)
         # Steps 3, 4 are performed in the noise scheduler
-        pred_noise = model(curr_image, t)
-        prev_image = noise_scheduler.remove_noise(curr_image, t_scalar, pred_noise)
-        images.append(prev_image)
-        curr_image = prev_image
+        pred_noise = model(curr_x, t)
+        prev_x = noise_scheduler.remove_noise(curr_x, t_scalar, pred_noise)
+        images.append(prev_x)
+        curr_x = prev_x
 
     ret = {
-        'image': prev_image,
+        'image': prev_x,
         'images': images
     }
     return ret
@@ -194,14 +184,15 @@ def save(config, model, frames, losses):
     print(f"Saving frames in {frame_path}...")
     np.save(frame_path, frames)
 
+
 def trainer():
 
-    # init objects
+    # init
     config = make_config()
     dataset = datasets.get_dataset(config.dataset)
     dataloader = DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True, drop_last=True)
     model = MLP(hidden_size=config.hidden_size, hidden_layers=config.hidden_layers, emb_size=config.embedding_size, time_emb=config.time_embedding, input_emb=config.input_embedding)
-    noise_scheduler = NoiseScheduler(num_timesteps=config.num_timesteps)
+    noise_scheduler = DDPMNoiseScheduler(num_timesteps=config.num_timesteps)
     optimizer = AdamW(model.parameters(), lr=config.learning_rate)
 
     # train ddpm
@@ -210,7 +201,7 @@ def trainer():
     for epoch in range(config.num_epochs):
         progress_bar = tqdm(total=len(dataloader))
         progress_bar.set_description(f"Epoch {epoch}")
-        for step, batch in enumerate(dataloader):
+        for _, batch in enumerate(dataloader):
             # train step
             train_ret = train(batch, model, noise_scheduler, optimizer)
             progress_bar.update(1)
