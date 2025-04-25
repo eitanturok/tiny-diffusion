@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import datasets
+from utils import animate_reverse_process, animate_training, save_model, save_losses, save_frames
 from positional_embeddings import PositionalEmbedding
 
 class Block(nn.Module):
@@ -153,38 +154,6 @@ def make_config():
     config = parser.parse_args()
     return config
 
-
-def save(config, model, frames, losses):
-    outdir = f"exps/{config.experiment_name}"
-    os.makedirs(outdir, exist_ok=True)
-
-    model_path = f"{outdir}/model.pth"
-    print(f"Saving model in {model_path}...")
-    torch.save(model.state_dict(), model_path)
-
-    imgdir = f"{outdir}/images"
-    print(f"Saving images in {imgdir}...")
-    os.makedirs(imgdir, exist_ok=True)
-    frames = np.stack(frames)
-    xmin, xmax = -6, 6
-    ymin, ymax = -6, 6
-    for i, frame in enumerate(frames):
-        plt.figure(figsize=(10, 10))
-        plt.scatter(frame[:, 0], frame[:, 1])
-        plt.xlim(xmin, xmax)
-        plt.ylim(ymin, ymax)
-        plt.savefig(f"{imgdir}/{i:04}.png")
-        plt.close()
-
-    loss_path = f"{outdir}/loss.npy"
-    print(f"Saving loss as numpy array in {loss_path}...")
-    np.save(loss_path, np.array(losses))
-
-    frame_path = f"{outdir}/frames.npy"
-    print(f"Saving frames in {frame_path}...")
-    np.save(frame_path, frames)
-
-
 def trainer():
 
     # init
@@ -201,8 +170,7 @@ def trainer():
     for epoch in range(config.num_epochs):
         progress_bar = tqdm(total=len(dataloader))
         progress_bar.set_description(f"Epoch {epoch}")
-        for _, batch in enumerate(dataloader):
-            # train step
+        for batch in dataloader:
             train_ret = train(batch, model, noise_scheduler, optimizer)
             progress_bar.update(1)
             logs = {"loss": train_ret['loss'], "step": global_step}
@@ -212,12 +180,18 @@ def trainer():
         progress_bar.close()
 
         if epoch % config.save_images_step == 0 or epoch == config.num_epochs - 1:
-            # sample step
             sample_ret = sample(batch['data'].shape, model, noise_scheduler, eval_batch_size=config.eval_batch_size)
             frames.append(sample_ret['image'].numpy())
 
     # save stuff
-    save(config, model, frames, losses)
+    outdir = f"exps/{config.experiment_name}"
+    os.makedirs(outdir, exist_ok=True)
+
+    save_model(model, outdir)
+    save_losses(losses, outdir)
+    save_frames(frames, outdir)
+    animate_reverse_process(sample_ret['images'], config.num_timesteps, outdir)
+    animate_training(frames, outdir)
 
 
 if __name__ == "__main__":
