@@ -42,9 +42,9 @@ def animate_training(frames, outdir):
     animation.save(train_path)
     return animation
 
-def animate_reverse_process(reverse_samples, num_timesteps, outdir):
+def animate_reverse_process(reverse_samples, global_step, num_timesteps, outdir):
 
-    reverse_path = f"{outdir}/reverse_process.mp4"
+    reverse_path = f"{outdir}/reverse_process_{global_step}.mp4"
     print(f"Animating reverse process in {reverse_path}...")
 
     xmin, xmax = -3.5, 3.5
@@ -56,7 +56,7 @@ def animate_reverse_process(reverse_samples, num_timesteps, outdir):
     for i, sample in enumerate(reverse_samples):
         plt.scatter(sample[:, 0], sample[:, 1], alpha=0.5, s=15, color="blue")
         ax.text(0.0, 0.95, f"Sample step {i: 4} / {num_timesteps}", transform=ax.transAxes)
-        ax.text(0.0, 1.01, "Reverse Process after training", transform=ax.transAxes, size=15)
+        ax.text(0.0, 1.01, f"Reverse Process after training for {global_step} steps", transform=ax.transAxes, size=15)
         plt.xlim(xmin, xmax)
         plt.ylim(ymin, ymax)
         plt.axis("off")

@@ -150,7 +150,7 @@ def make_config():
     parser.add_argument("--hidden_layers", type=int, default=3)
     parser.add_argument("--time_embedding", type=str, default="sinusoidal", choices=["sinusoidal", "learnable", "linear", "zero"])
     parser.add_argument("--input_embedding", type=str, default="sinusoidal", choices=["sinusoidal", "learnable", "linear", "identity"])
-    parser.add_argument("--save_images_step", type=int, default=1)
+    parser.add_argument("--save_images_step", type=int, default=10)
     config = parser.parse_args()
     return config
 
@@ -163,6 +163,9 @@ def trainer():
     model = MLP(hidden_size=config.hidden_size, hidden_layers=config.hidden_layers, emb_size=config.embedding_size, time_emb=config.time_embedding, input_emb=config.input_embedding)
     noise_scheduler = DDPMNoiseScheduler(num_timesteps=config.num_timesteps)
     optimizer = AdamW(model.parameters(), lr=config.learning_rate)
+
+    outdir = f"exps/{config.experiment_name}"
+    os.makedirs(outdir, exist_ok=True)
 
     # train ddpm
     global_step, frames, losses = 0, [], []
@@ -181,16 +184,14 @@ def trainer():
 
         if epoch % config.save_images_step == 0 or epoch == config.num_epochs - 1:
             sample_ret = sample(batch['data'].shape, model, noise_scheduler, eval_batch_size=config.eval_batch_size)
+            animate_reverse_process(sample_ret['images'], global_step, config.num_timesteps, outdir)
             frames.append(sample_ret['image'].numpy())
 
     # save stuff
-    outdir = f"exps/{config.experiment_name}"
-    os.makedirs(outdir, exist_ok=True)
-
     save_model(model, outdir)
     save_losses(losses, outdir)
     save_frames(frames, outdir)
-    animate_reverse_process(sample_ret['images'], config.num_timesteps, outdir)
+    animate_reverse_process(sample_ret['images'], global_step, config.num_timesteps, outdir)
     animate_training(frames, outdir)
 
 
