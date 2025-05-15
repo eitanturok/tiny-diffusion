@@ -45,7 +45,7 @@ class MLP(nn.Module):
         return x
 
 
-class DDPMNoiseScheduler():
+class DDPM():
     def __init__(self, num_timesteps=1000, beta_start=0.0001, beta_end=0.02):
         self.num_timesteps = num_timesteps
         self.betas = torch.linspace(beta_start, beta_end, num_timesteps, dtype=torch.float32)
@@ -81,7 +81,7 @@ class DDPMNoiseScheduler():
         return self.num_timesteps
 
 # "Algorithm 1: Training" from paper, pg 4.
-def train(batch, model, noise_scheduler:DDPMNoiseScheduler, optimizer:AdamW):
+def train(batch, model, noise_scheduler:DDPM, optimizer:AdamW):
     model.train()
 
     # Step 2: this step is implicitly performed when we choose our data x
@@ -112,7 +112,7 @@ def train(batch, model, noise_scheduler:DDPMNoiseScheduler, optimizer:AdamW):
 
 # "Algorithm 2: Sampling" from paper, pg 4.
 @torch.no_grad()
-def sample(batch_shape, model, noise_scheduler:DDPMNoiseScheduler, eval_batch_size:int=1):
+def sample(batch_shape, model, noise_scheduler:DDPM, eval_batch_size:int=1):
     model.eval()
     device = next(model.parameters()).device
 
@@ -161,7 +161,7 @@ def trainer():
     dataset = datasets.get_dataset(config.dataset)
     dataloader = DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True, drop_last=True)
     model = MLP(hidden_size=config.hidden_size, hidden_layers=config.hidden_layers, emb_size=config.embedding_size, time_emb=config.time_embedding, input_emb=config.input_embedding)
-    noise_scheduler = DDPMNoiseScheduler(num_timesteps=config.num_timesteps)
+    ddpm = DDPM(num_timesteps=config.num_timesteps)
     optimizer = AdamW(model.parameters(), lr=config.learning_rate)
 
     outdir = f"exps/{config.experiment_name}"
@@ -174,7 +174,7 @@ def trainer():
         progress_bar = tqdm(total=len(dataloader))
         progress_bar.set_description(f"Epoch {epoch}")
         for batch in dataloader:
-            train_ret = train(batch, model, noise_scheduler, optimizer)
+            train_ret = train(batch, model, ddpm, optimizer)
             progress_bar.update(1)
             logs = {"loss": train_ret['loss'], "step": global_step}
             losses.append(train_ret['loss'])
@@ -183,7 +183,7 @@ def trainer():
         progress_bar.close()
 
         if epoch % config.save_images_step == 0 or epoch == config.num_epochs - 1:
-            sample_ret = sample(batch['data'].shape, model, noise_scheduler, eval_batch_size=config.eval_batch_size)
+            sample_ret = sample(batch['data'].shape, model, ddpm, eval_batch_size=config.eval_batch_size)
             animate_reverse_process(sample_ret['images'], global_step, config.num_timesteps, outdir)
             frames.append(sample_ret['image'].numpy())
 
